@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""ontem: list recent Claude Code sessions across folders and accounts, then
+reopen the chosen ones, each in its own Windows Terminal tab in the right folder.
+
+Usage:
+  ontem          sessions from the last 24h (on Monday, since Friday)
+  ontem 3        sessions from the last 3 days
+  ontem -a       every session, not only the latest one per folder
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+# (config dir, command that opens Claude with that account)
+SOURCES = [(HOME / ".claude", "claude")] + [
+    (d, f"ccs {d.name}")
+    for d in sorted((HOME / ".ccs" / "instances").glob("*"))
+    if d.is_dir()
+]
+MIN_PROMPTS = 1
+TITLE_WIDTH = 60
+# Windows Terminal profile used for the tabs (the "Ubuntu" one, from settings.json)
+WT_PROFILE = "{51855cb2-8cce-5362-8f54-464b92b32386}"
+WEEKDAYS = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+
+
+def window_seconds(args):
+    days = next((int(a) for a in args if a.isdigit()), None)
+    if days is None:
+        days = 3 if datetime.now().weekday() == 0 else 1
+    return days * 86400
+
+
+def read_session(path):
+    cwd = title = first_prompt = None
+    prompts = 0
+    interactive = False
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            kind = rec.get("type")
+            if kind == "custom-title":
+                title = rec.get("customTitle") or title
+            elif kind == "ai-title" and not title:
+                title = rec.get("aiTitle")
+            elif kind == "user" and not rec.get("isSidechain"):
+                cwd = cwd or rec.get("cwd")
+                interactive = interactive or rec.get("entrypoint") == "cli"
+                content = rec.get("message", {}).get("content")
+                if isinstance(content, str) and not content.startswith("<"):
+                    prompts += 1
+                    first_prompt = first_prompt or content
+    # sdk-cli sessions are scripted runs (claude -p, tests), not work to resume
+    if prompts < MIN_PROMPTS or not cwd or not interactive:
+        return None
+    if cwd.startswith("/tmp/") or not os.path.isdir(cwd):
+        return None
+    return {"cwd": cwd, "title": title or first_prompt.replace("\n", " ")}
+
+
+def collect(since, latest_only):
+    sessions = []
+    for config_dir, launcher in SOURCES:
+        for path in (config_dir / "projects").glob("*/*.jsonl"):
+            mtime = path.stat().st_mtime
+            if mtime < since:
+                continue
+            info = read_session(path)
+            if info:
+                info.update(id=path.stem, mtime=mtime, launcher=launcher)
+                sessions.append(info)
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    if latest_only:
+        seen, unique = set(), []
+        for s in sessions:
+            key = (s["launcher"], s["cwd"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(s)
+        sessions = unique
+    return sessions
+
+
+def short(path):
+    return path.replace(str(HOME), "~", 1)
+
+
+def show(sessions):
+    for n, s in enumerate(sessions, 1):
+        moment = datetime.fromtimestamp(s["mtime"])
+        when = f"{WEEKDAYS[moment.weekday()]} {moment:%H:%M}"
+        title = s["title"][:TITLE_WIDTH]
+        print(f"\033[1m{n:>2}\033[0m  {when}  \033[36m{short(s['cwd'])}\033[0m"
+              f"  \033[33m[{s['launcher']}]\033[0m\n      {title}")
+
+
+def parse_choice(answer, total):
+    answer = answer.strip().lower()
+    if answer in ("t", "todas", "todos"):
+        return list(range(total))
+    picked = []
+    for token in answer.replace(",", " ").split():
+        if token.isdigit() and 1 <= int(token) <= total:
+            picked.append(int(token) - 1)
+    return picked
+
+
+def open_tab(session):
+    # no ";" here: wt.exe would split it into a second, broken tab
+    resume = f"{session['launcher']} -r {session['id']} || true && exec bash"
+    distro = os.environ.get("WSL_DISTRO_NAME", "Ubuntu")
+    tab_title = Path(session["cwd"]).name
+    subprocess.Popen(
+        ["wt.exe", "-w", "0", "nt", "-p", WT_PROFILE, "--title", tab_title,
+         "wsl.exe", "-d", distro, "--cd", session["cwd"],
+         "bash", "-lic", resume],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def main(args):
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+    sessions = collect(time.time() - window_seconds(args), "-a" not in args)
+    if not sessions:
+        print("Nenhuma sessão no período. Tente: ontem 3")
+        return
+    show(sessions)
+    try:
+        answer = input("\nAbrir quais? (ex.: 1 3 4, t = todas, Enter = nenhuma): ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    picked = parse_choice(answer, len(sessions))
+    for i in picked:
+        open_tab(sessions[i])
+        time.sleep(0.4)  # keeps Windows Terminal from opening tabs out of order
+    if picked:
+        print(f"{len(picked)} aba(s) aberta(s) no Windows Terminal.")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
